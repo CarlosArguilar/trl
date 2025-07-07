@@ -99,6 +99,15 @@ class VLLMClient:
         ```
     """
 
+    # ---------------------------------------------------------------------
+    # Debug utility
+    # ---------------------------------------------------------------------
+    def _debug(self, message: str, **kwargs):
+        """Utility to print verbose debug information with types for every vLLM-related action."""
+        print(f"[VLLM CLIENT DEBUG] {message}")
+        for k, v in kwargs.items():
+            print(f"  • {k} (type={type(v).__name__}): {v}")
+
     def __init__(
         self,
         base_url: Optional[str] = None,
@@ -125,6 +134,17 @@ class VLLMClient:
             self.server_port = server_port
             self.base_url = f"http://{self.host}:{self.server_port}"
         self.group_port = group_port
+
+        # DEBUG
+        self._debug(
+            "Initialized VLLMClient",
+            base_url=self.base_url,
+            host=self.host,
+            server_port=server_port,
+            group_port=group_port,
+            connection_timeout=connection_timeout,
+        )
+
         self.check_server(connection_timeout)  # check server and fail after timeout
 
     def check_server(self, total_timeout: float = 0.0, retry_interval: float = 2.0):
@@ -139,6 +159,7 @@ class VLLMClient:
                 Total timeout duration in seconds.
         """
         url = f"{self.base_url}/health/"
+        self._debug("Checking server health", url=url, total_timeout=total_timeout, retry_interval=retry_interval)
         start_time = time.time()  # Record the start time
 
         while True:
@@ -208,21 +229,20 @@ class VLLMClient:
                 List of lists of token IDs representing the model-generated completions for each prompt.
         """
         url = f"{self.base_url}/generate/"
-        response = self.session.post(
-            url,
-            json={
-                "prompts": prompts,
-                "n": n,
-                "repetition_penalty": repetition_penalty,
-                "temperature": temperature,
-                "top_p": top_p,
-                "top_k": top_k,
-                "min_p": min_p,
-                "max_tokens": max_tokens,
-                "guided_decoding_regex": guided_decoding_regex,
-                "generation_kwargs": generation_kwargs or {},
-            },
-        )
+        payload = {
+            "prompts": prompts,
+            "n": n,
+            "repetition_penalty": repetition_penalty,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "min_p": min_p,
+            "max_tokens": max_tokens,
+            "guided_decoding_regex": guided_decoding_regex,
+            "generation_kwargs": generation_kwargs or {},
+        }
+        self._debug("POST /generate", url=url, payload_sample=str({k: payload[k] for k in list(payload)[:5]}), payload_keys=list(payload.keys()))
+        response = self.session.post(url, json=payload)
         if response.status_code == 200:
             return response.json()["completion_ids"]
         else:
@@ -234,6 +254,7 @@ class VLLMClient:
         """
         # Get the world size from the server
         url = f"{self.base_url}/get_world_size/"
+        self._debug("Fetching world size from server", url=url)
         response = requests.get(url)
         if response.status_code == 200:
             vllm_world_size = response.json()["world_size"]
@@ -245,7 +266,7 @@ class VLLMClient:
 
         # Initialize weight update group
         url = f"{self.base_url}/init_communicator/"
-        # In the server side, the host is set to 0.0.0.0
+        self._debug("Initializing communicator on server", url=url, host="0.0.0.0", port=self.group_port, world_size=world_size)
         response = self.session.post(url, json={"host": "0.0.0.0", "port": self.group_port, "world_size": world_size})
         if response.status_code != 200:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
@@ -257,7 +278,9 @@ class VLLMClient:
 
         # Set up the communication group for weight broadcasting
         pg = StatelessProcessGroup.create(host=self.host, port=self.group_port, rank=self.rank, world_size=world_size)
+        self._debug("Created StatelessProcessGroup", host=self.host, port=self.group_port, rank=self.rank, world_size=world_size)
         self.pynccl_comm = PyNcclCommunicator(pg, device=0)
+        self._debug("Initialized PyNcclCommunicator", communicator=str(self.pynccl_comm), device=0)
 
         # When the client object is deleted, close the weight update group
         atexit.register(self.close_communicator)
@@ -274,11 +297,13 @@ class VLLMClient:
         """
         dtype, shape = str(weights.dtype), tuple(weights.shape)
         url = f"{self.base_url}/update_named_param/"
+        self._debug("POST /update_named_param", url=url, name=name, dtype=dtype, shape=shape)
         response = self.session.post(url, json={"name": name, "dtype": dtype, "shape": shape})
         if response.status_code != 200:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
         # Broadcast the weights to the other processes
+        self._debug("Broadcasting weights via NCCL", param=name, src_rank=self.rank, numel=weights.numel())
         self.pynccl_comm.broadcast(weights, src=self.rank)
         self.pynccl_comm.group.barrier()
 
@@ -290,6 +315,7 @@ class VLLMClient:
             model (`nn.Module`):
                 Model whose parameters (weights/biases) are to be updated.
         """
+        self._debug("Updating full model parameters", total_params=sum(1 for _ in model.named_parameters()))
         for name, param in model.named_parameters():
             # Update each parameter individually
             self.update_named_param(name, param.data)
@@ -299,6 +325,7 @@ class VLLMClient:
         Resets the prefix cache for the model.
         """
         url = f"{self.base_url}/reset_prefix_cache/"
+        self._debug("POST /reset_prefix_cache", url=url)
         response = self.session.post(url)
         if response.status_code != 200:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
@@ -309,6 +336,7 @@ class VLLMClient:
         """
         url = f"{self.base_url}/close_communicator/"
 
+        self._debug("POST /close_communicator", url=url)
         try:
             response = self.session.post(url)
         except ConnectionError:

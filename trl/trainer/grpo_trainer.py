@@ -644,6 +644,12 @@ class GRPOTrainer(Trainer):
                     base_url = args.vllm_server_base_url
                 else:
                     base_url = f"http://{args.vllm_server_host}:{args.vllm_server_port}"
+                # DEBUG
+                self._vllm_debug(
+                    "Initializing VLLMClient",
+                    base_url=base_url,
+                    connection_timeout=args.vllm_server_timeout,
+                )
                 self.vllm_client = VLLMClient(base_url=base_url, connection_timeout=args.vllm_server_timeout)
                 self.vllm_client.init_communicator()
 
@@ -666,6 +672,21 @@ class GRPOTrainer(Trainer):
                         ]
                     )
 
+                # DEBUG
+                self._vllm_debug(
+                    "Initializing colocated vLLM LLM",
+                    model_name=model.name_or_path,
+                    tensor_parallel_size=args.vllm_tensor_parallel_size,
+                    gpu_memory_utilization=self.vllm_gpu_memory_utilization,
+                    max_num_seqs=self.args.per_device_train_batch_size
+                    * self.vllm_tensor_parallel_size
+                    * self.args.gradient_accumulation_steps,
+                    max_model_len=self.max_prompt_length + self.max_completion_length,
+                    distributed_executor_backend="external_launcher",
+                    seed=self.accelerator.process_index // self.vllm_tensor_parallel_size,
+                    max_num_batched_tokens=4096,
+                )
+
                 self.llm = LLM(
                     model=model.name_or_path,
                     tensor_parallel_size=args.vllm_tensor_parallel_size,
@@ -675,9 +696,7 @@ class GRPOTrainer(Trainer):
                     * self.args.gradient_accumulation_steps,
                     max_model_len=self.max_prompt_length + self.max_completion_length,
                     distributed_executor_backend="external_launcher",
-                    # Feed identical seed for tp groups to ensure sampling results are the same across workers
                     seed=self.accelerator.process_index // self.vllm_tensor_parallel_size,
-                    # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
                     max_num_batched_tokens=4096,
                 )
 
@@ -1119,6 +1138,21 @@ class GRPOTrainer(Trainer):
                     # num_generations outputs for each one. This is faster than generating outputs for each duplicate
                     # prompt individually.
                     ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
+                    # DEBUG
+                    self._vllm_debug(
+                        "Calling VLLMClient.generate",
+                        prompts_sample=ordered_set_of_prompts[: min(3, len(ordered_set_of_prompts))],
+                        prompts_total=len(ordered_set_of_prompts),
+                        n=self.num_generations,
+                        repetition_penalty=self.repetition_penalty,
+                        temperature=self.temperature,
+                        top_p=self.top_p,
+                        top_k=-1 if self.top_k is None else self.top_k,
+                        min_p=0.0 if self.min_p is None else self.min_p,
+                        max_tokens=self.max_completion_length,
+                        guided_decoding_regex=self.guided_decoding_regex,
+                        generation_kwargs=self.args.generation_kwargs,
+                    )
                     with profiling_context(self, "vLLM.generate"):
                         completion_ids = self.vllm_client.generate(
                             prompts=ordered_set_of_prompts,
@@ -1173,6 +1207,14 @@ class GRPOTrainer(Trainer):
                     all_prompts_text = [p for sublist in gathered_prompts for p in sublist]
                 else:
                     all_prompts_text = prompts_text
+
+                # DEBUG
+                self._vllm_debug(
+                    "Calling vLLM.generate",
+                    prompts_sample=all_prompts_text[: min(3, len(all_prompts_text))],
+                    prompts_total=len(all_prompts_text),
+                    sampling_params=vars(sampling_params),
+                )
 
                 with profiling_context(self, "vLLM.generate"):
                     all_outputs = self.llm.generate(all_prompts_text, sampling_params=sampling_params, use_tqdm=False)
@@ -1639,3 +1681,21 @@ class GRPOTrainer(Trainer):
         )
 
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
+
+    # Helper method for verbose vLLM debugging
+    def _vllm_debug(self, message: str, **kwargs):
+        """
+        Print detailed information about vLLM related operations to help debugging.
+        The log is only printed once per process (main process when Accelerator
+        is already initialized) to reduce noise.
+        """
+        try:
+            is_main = getattr(self, "accelerator", None) is None or self.accelerator.is_main_process
+        except Exception:
+            # In case self.accelerator is not yet available
+            is_main = True
+        if not is_main:
+            return
+        print(f"[vLLM DEBUG] {message}")
+        for key, value in kwargs.items():
+            print(f"  • {key} (type={type(value).__name__}): {value}")
