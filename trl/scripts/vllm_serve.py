@@ -74,6 +74,22 @@ logger = logging.getLogger(__name__)
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 
+# ---------------------------------------------------------------------------
+# Debug utility – always prints detailed information about vLLM serve actions
+# ---------------------------------------------------------------------------
+
+
+def _debug(message: str, **kwargs):
+    """Print detailed debug info with value types to stdout."""
+    print(f"[VLLM SERVE DEBUG] {message}")
+    for k, v in kwargs.items():
+        try:
+            printable = v if len(str(v)) < 400 else str(v)[:400] + "..."
+        except Exception:
+            printable = "<unprintable>"
+        print(f"  • {k} (type={type(v).__name__}): {printable}")
+
+
 class WeightSyncWorkerExtension:
     """
     A vLLM worker extension that enables weight synchronization between a client and multiple server workers.
@@ -113,6 +129,13 @@ class WeightSyncWorkerExtension:
                 "roles/ranks within the same communicator. This setup is unsupported and will likely lead to program "
                 "hangs or incorrect behavior. Ensure that trainer is using different devices than vLLM server."
             )
+        _debug(
+            "WeightSyncWorkerExtension.init_communicator",
+            host=host,
+            port=port,
+            world_size=world_size,
+        )
+
         # Get the rank of the current worker in the global world group.
         rank = get_world_group().rank
 
@@ -124,6 +147,13 @@ class WeightSyncWorkerExtension:
 
         # The client process that sends updated weights has the highest rank (world_size - 1).
         self.client_rank = world_size - 1
+
+        _debug(
+            "NCCL communicator initialized",
+            rank=rank,
+            device=self.device,
+            client_rank=self.client_rank,
+        )
 
     def update_named_param(self, name: str, dtype: str, shape: Sequence[int]) -> None:
         """
@@ -140,6 +170,8 @@ class WeightSyncWorkerExtension:
         if self.pynccl_comm is None:
             raise RuntimeError("Communicator not initialized. Call `init_communicator` first.")
 
+        _debug("update_named_param called", name=name, dtype=dtype, shape=shape)
+
         dtype = getattr(torch, dtype.split(".")[-1])
         # Allocate memory for the incoming weight tensor on the correct device.
         weight = torch.empty(shape, dtype=dtype, device=self.device)
@@ -150,6 +182,8 @@ class WeightSyncWorkerExtension:
 
         # Load the received weights into the model.
         self.model_runner.model.load_weights(weights=[(name, weight)])
+
+        _debug("Parameter updated on worker", name=name, shape=shape)
 
     def close_communicator(self) -> None:
         """
@@ -303,6 +337,15 @@ def llm_worker(
     os.environ["VLLM_DP_SIZE"] = str(script_args.data_parallel_size)
     os.environ["VLLM_DP_MASTER_PORT"] = str(master_port)
 
+    _debug(
+        "Starting llm_worker",
+        data_parallel_rank=data_parallel_rank,
+        master_port=master_port,
+        script_args=script_args,
+    )
+
+    _debug("Instantiating vLLM LLM", model=script_args.model, tensor_parallel_size=script_args.tensor_parallel_size)
+
     llm = LLM(
         model=script_args.model,
         revision=script_args.revision,
@@ -323,10 +366,13 @@ def llm_worker(
     # Send ready signal to parent process
     connection.send({"status": "ready"})
 
+    _debug("Worker ready", rank=data_parallel_rank)
+
     while True:
         # Wait for commands from the parent process
         try:
             command = connection.recv()
+            _debug("Worker received command", command_type=command.get("type"), method=command.get("method"))
         except KeyboardInterrupt:
             llm.collective_rpc(method="close_communicator")
             break
@@ -338,6 +384,7 @@ def llm_worker(
             method = getattr(llm, method_name)
             result = method(*args, **kwargs)
             if command["type"] == "call":
+                _debug("Worker sending result back to parent", method=command["method"])
                 connection.send(result)
         elif command["type"] == "shutdown":
             break
@@ -497,6 +544,8 @@ def main(script_args: ScriptArguments):
                 row["multi_modal_data"] = {"image": Image.open(BytesIO(base64.b64decode(image)))}
             prompts.append(row)
 
+        _debug("HTTP /generate called", num_prompts=len(request.prompts), args=request.dict())
+
         # Guided decoding, if enabled
         if request.guided_decoding_regex is not None:
             guided_decoding = GuidedDecodingParams(backend="outlines", regex=request.guided_decoding_regex)
@@ -515,6 +564,8 @@ def main(script_args: ScriptArguments):
         }
         generation_kwargs.update(request.generation_kwargs)
         sampling_params = SamplingParams(**generation_kwargs)
+
+        _debug("SamplingParams constructed", params=vars(sampling_params))
 
         # Evenly distribute prompts across DP ranks
         chunked_prompts = chunk_list(prompts, script_args.data_parallel_size)
@@ -538,6 +589,7 @@ def main(script_args: ScriptArguments):
         # Flatten and combine all results
         all_outputs = list(chain.from_iterable(all_outputs))  # from list of list to single list
         completion_ids = [list(output.token_ids) for outputs in all_outputs for output in outputs.outputs]
+        _debug("/generate returning", total_completions=len(completion_ids))
         return {"completion_ids": completion_ids}
 
     class InitCommunicatorRequest(BaseModel):
@@ -559,6 +611,8 @@ def main(script_args: ScriptArguments):
                 - `client_device_uuid` (`str`): UUID of the device of client main process. Used to assert that devices
                   are different from vLLM workers devices.
         """
+        _debug("HTTP /init_communicator called", args=request.dict())
+
         world_size = script_args.tensor_parallel_size * script_args.data_parallel_size + 1
 
         # The function init_communicator is called this way: init_communicator(host, port, world_size)
@@ -571,6 +625,7 @@ def main(script_args: ScriptArguments):
         for connection in connections:
             connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
 
+        _debug("/init_communicator returning", world_size=world_size)
         return {"message": "Request received, initializing communicator"}
 
     class UpdateWeightsRequest(BaseModel):
@@ -592,6 +647,8 @@ def main(script_args: ScriptArguments):
                 - `shape` (list of `int`): Shape of the weight
 
         """
+        _debug("HTTP /update_named_param called", args=request.dict())
+
         # The function update_named_param is called this way: update_named_param("name", "torch.float32", (10, 10))
         # So with collective_rpc we need to call it this way:
         # llm.collective_rpc("update_named_param", args=("name", "torch.float32", (10, 10)))
@@ -599,6 +656,7 @@ def main(script_args: ScriptArguments):
         for connection in connections:
             connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
 
+        _debug("/update_named_param returning", name=request.name)
         return {"message": "Request received, updating named parameter"}
 
     @app.post("/reset_prefix_cache/")
@@ -611,6 +669,7 @@ def main(script_args: ScriptArguments):
         # Wait for and collect all results
         all_outputs = [connection.recv() for connection in connections]
         success = all(output for output in all_outputs)
+        _debug("/reset_prefix_cache returning", success=success)
         return {"message": "Request received, resetting prefix cache status: " + str(success)}
 
     @app.post("/close_communicator/")
@@ -618,9 +677,12 @@ def main(script_args: ScriptArguments):
         """
         Closes the weight update group and cleans up associated resources.
         """
+        _debug("HTTP /close_communicator called")
+
         kwargs = {"method": "close_communicator"}
         for connection in connections:
             connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
+        _debug("/close_communicator returning")
         return {"message": "Request received, closing communicator"}
 
     # Start the server
